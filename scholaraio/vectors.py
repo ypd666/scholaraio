@@ -86,7 +86,12 @@ def _load_model(cfg: Config | None = None):
         try:
             import torch
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
         except ImportError:
             device = "cpu"
     else:
@@ -156,6 +161,36 @@ def _profile_cache_key(model_name: str, gpu_name: str) -> str:
     return f"{model_name}::{gpu_name}"
 
 
+def _mps_gpu_name() -> str:
+    """Return a descriptive GPU name for MPS (Apple Silicon) devices.
+
+    Uses sysctl to get the chip name on macOS, falls back to platform info.
+    """
+    import platform
+
+    gpu_name = f"Apple {platform.machine()} MPS"
+    if platform.system() == "Darwin":
+        try:
+            import subprocess
+
+            chip = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+            if chip:
+                gpu_name = f"{chip} MPS"
+        except Exception:
+            pass
+    return gpu_name
+
+
+def _is_mps_memory_error(exc: Exception) -> bool:
+    """Check if an exception is MPS memory-related.
+
+    MPS raises RuntimeError for OOM instead of a specific exception type.
+    This checks the error message for memory-related keywords.
+    """
+    err_msg = str(exc).lower()
+    return any(x in err_msg for x in ("out of memory", "allocation", "malloc", "buffer", "memory"))
+
+
 def _run_profile(model, cfg: Config | None = None) -> dict:
     """Profile GPU memory per sample at various sequence lengths.
 
@@ -169,11 +204,14 @@ def _run_profile(model, cfg: Config | None = None) -> dict:
     """
     import torch
 
-    if not torch.cuda.is_available():
+    device = next(model.parameters() if hasattr(model, "parameters") else model[0].parameters()).device
+
+    if device.type == "mps":
+        return _run_profile_mps(model, cfg)
+    if device.type != "cuda":
         return {}
 
-    device = next(model.parameters() if hasattr(model, "parameters") else model[0].parameters()).device
-    if device.type != "cuda":
+    if not torch.cuda.is_available():
         return {}
 
     gpu_props = torch.cuda.get_device_properties(device)
@@ -242,18 +280,128 @@ def _run_profile(model, cfg: Config | None = None) -> dict:
     }
 
 
+def _run_profile_mps(model, cfg: Config | None = None) -> dict:
+    """Profile MPS (Apple Silicon) memory per sample at various sequence lengths.
+
+    Unlike CUDA, MPS lacks ``peak_memory_stats`` and reliable OOM exceptions.
+    This uses ``torch.mps.current_allocated_memory()`` before/after encoding
+    with ``synchronize()`` to capture incremental usage, and stops when memory
+    exceeds a safety threshold of ``recommended_max_memory``.
+
+    Returns:
+        Same schema as ``_run_profile`` so the adaptive batching logic works
+        unchanged.
+    """
+    import torch
+    import torch.mps
+
+    gpu_total = torch.mps.recommended_max_memory()
+    gpu_name = _mps_gpu_name()
+
+    tokenizer = model.tokenizer
+    per_sample: dict[int, int] = {}
+    filler = "turbulence flow particle dynamics simulation "
+    model_name = cfg.embed.model if cfg is not None else "Qwen/Qwen3-Embedding-0.6B"
+
+    # Warm up and measure baseline memory (model weights on MPS)
+    torch.mps.empty_cache()
+    torch.mps.synchronize()
+    tiny = filler[:20]
+    model.encode([tiny], normalize_embeddings=True, batch_size=1)
+    torch.mps.synchronize()
+    baseline = torch.mps.current_allocated_memory()
+
+    _log.info(
+        "[mps-profile] Profiling MPS memory for %s on %s (baseline=%.0f MB, recommended_max=%.0f MB) ...",
+        model_name,
+        gpu_name,
+        baseline / 1024**2,
+        gpu_total / 1024**2,
+    )
+    _log.warning("[mps-profile] Note: MPS lacks peak memory tracking; measurements may underestimate actual usage.")
+
+    # Safety: stop if allocated memory exceeds this fraction of recommended max.
+    # MPS doesn't throw clean OOM; exceeding this risks swap thrashing or crash.
+    mem_ceiling = gpu_total * 0.80
+
+    tgt_tokens = 64
+    max_tokens = getattr(model, "max_seq_length", 32768) or 32768
+
+    while tgt_tokens <= max_tokens:
+        raw = filler * (tgt_tokens // 4 + 10)
+        ids = tokenizer.encode(raw)[:tgt_tokens]
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+
+        torch.mps.empty_cache()
+        torch.mps.synchronize()
+        mem_before = torch.mps.current_allocated_memory()
+
+        try:
+            model.encode([text], normalize_embeddings=True, batch_size=1)
+            torch.mps.synchronize()
+            mem_after = torch.mps.current_allocated_memory()
+        except RuntimeError as exc:
+            # Check if it's a memory error we should handle, or something else
+            if not _is_mps_memory_error(exc):
+                _log.error("[mps-profile]   tokens=%5d  non-memory error: %s", tgt_tokens, exc)
+                raise
+            _log.info("[mps-profile]   tokens=%5d  memory error — stopping: %s", tgt_tokens, exc)
+            torch.mps.empty_cache()
+            break
+        except Exception as exc:
+            _log.error("[mps-profile]   tokens=%5d  unexpected error: %s", tgt_tokens, exc)
+            raise
+
+        incremental = max(0, mem_after - mem_before)
+        per_sample[tgt_tokens] = incremental
+
+        _log.info(
+            "[mps-profile]   tokens=%5d  incremental=%6.0f MB  (allocated=%.0f MB)",
+            tgt_tokens,
+            incremental / 1024**2,
+            mem_after / 1024**2,
+        )
+
+        # Stop before we risk swap thrashing
+        if mem_after > mem_ceiling:
+            _log.info(
+                "[mps-profile]   tokens=%5d  approaching memory ceiling (%.0f/%.0f MB) — stopping",
+                tgt_tokens,
+                mem_after / 1024**2,
+                gpu_total / 1024**2,
+            )
+            break
+
+        tgt_tokens *= 2
+
+    torch.mps.empty_cache()
+
+    if not per_sample:
+        return {}
+
+    return {
+        "gpu_total_bytes": gpu_total,
+        "baseline_bytes": baseline,
+        "gpu_name": gpu_name,
+        "model_name": model_name,
+        "per_sample": {str(k): v for k, v in per_sample.items()},
+        "profiled_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
 def _load_or_create_profile(model, cfg: Config | None = None) -> dict:
-    """Load cached GPU profile or run profiling."""
+    """Load cached GPU/MPS profile or run profiling."""
     import torch
 
-    if not torch.cuda.is_available():
-        return {}
-
     device = next(model.parameters() if hasattr(model, "parameters") else model[0].parameters()).device
-    if device.type != "cuda":
+
+    if device.type == "mps":
+        gpu_name = _mps_gpu_name()
+    elif device.type == "cuda" and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_properties(device).name
+    else:
         return {}
 
-    gpu_name = torch.cuda.get_device_properties(device).name
     model_name = cfg.embed.model if cfg is not None else "Qwen/Qwen3-Embedding-0.6B"
     cache_key = _profile_cache_key(model_name, gpu_name)
 
@@ -393,6 +541,9 @@ def _embed_batch(texts: list[str], cfg: Config | None = None) -> list[list[float
     # Encode each bucket with adaptive batch_size
     import torch
 
+    device = next(model.parameters() if hasattr(model, "parameters") else model[0].parameters()).device
+    is_mps = device.type == "mps"
+
     results = [None] * len(texts)
     total_done = 0
     show_progress = len(texts) > 100
@@ -404,21 +555,33 @@ def _embed_batch(texts: list[str], cfg: Config | None = None) -> list[list[float
 
         _log.debug("[embed] bucket tokens<=%d: %d texts, batch_size=%d", bucket_key, len(bucket_texts), bs)
 
-        # Encode with OOM retry
+        # Encode with OOM retry (handles both CUDA and MPS)
         encoded = None
         while encoded is None:
             try:
                 encoded = model.encode(bucket_texts, normalize_embeddings=True, batch_size=bs)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
+                if is_mps:
+                    torch.mps.synchronize()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                # MPS raises RuntimeError on memory issues, not a typed OOM
+                if is_mps:
+                    if not _is_mps_memory_error(exc):
+                        raise  # Re-raise if not memory-related
+                    torch.mps.empty_cache()
+                else:
+                    if not isinstance(exc, torch.cuda.OutOfMemoryError):
+                        raise
+                    torch.cuda.empty_cache()
+
                 if bs > 1:
                     bs = max(1, bs // 2)
                     _log.warning("[embed] OOM, retrying with batch_size=%d", bs)
                 else:
                     _log.warning("[embed] OOM at batch_size=1, falling back to CPU")
+                    original_device = device.type
                     model_cpu = model.to("cpu")
                     encoded = model_cpu.encode(bucket_texts, normalize_embeddings=True, batch_size=1)
-                    model.to("cuda")
+                    model.to(original_device)
 
         for idx, vec in zip(indices, encoded):
             results[idx] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
